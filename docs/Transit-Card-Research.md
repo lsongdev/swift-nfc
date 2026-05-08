@@ -1,0 +1,176 @@
+# Transit Card Research
+
+Research date: 2026-05-09
+
+This note captures the CardBal IDA findings, public implementation checks, and the CoreExtendedNFC changes made for the current transit-card balance work.
+
+## Public Reference Sources
+
+The transit readers are cross-checked against these open-source projects:
+
+| Project    | Local clone           | Revision inspected                         | Useful areas                                                                                   |
+| ---------- | --------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| Metrodroid | `/tmp/metrodroid-src` | `04a603ba639f7a270b7bdbf24158c7d601087c29` | EasyCard Classic layout, Octopus raw layout, T-Union balance bit layout, KSX6924 card support. |
+| FareBot    | `/tmp/farebot-src`    | `dc09f6f014ea3675b64bcd38335b4b78d77fa374` | Octopus raw-layout tests, ISO 7816 transit-card scaffolding, China and KSX6924 card modules.   |
+| Octopus HK | Public FAQ            | Inspected 2026-05-09                       | Official HK$35/HK$50 convenience-limit eligibility by card issue class.                        |
+
+## CardBal IDA Source
+
+CardBal was inspected through the local IDA MCP instance:
+
+- IDB: `/Users/qaq/Desktop/cardbal.unfair-iossim.app/CardBal.i64`
+- MCP endpoint: `http://127.0.0.1:13337/mcp`
+- Binary: `CardBal`
+
+Useful CardBal addresses:
+
+| Area                     |       Address | Finding                                                                                                                 |
+| ------------------------ | ------------: | ----------------------------------------------------------------------------------------------------------------------- |
+| FeliCa profile table     | `0x1002DD064` | Builds FeliCa transit-card profiles.                                                                                    |
+| Japan Transit IC balance | `0x1002DD7E4` | Parses service `008B` balance from bytes 11-12, little-endian.                                                          |
+| Octopus balance          | `0x1002DDC08` | Parses service `0117` block 0 first four bytes, big-endian raw value.                                                   |
+| Octopus offset           | `0x1001A1AEC` | Returns raw offset `350` from 2010-12-01 and legacy offset `35`; this matches old physical-card scans seen in practice. |
+| Japan brand mapping      | `0x1002DB5D8` | Maps issuer/operator hints such as `JE` to Suica, `JW` to ICOCA, `NR` to Nimoca.                                        |
+| Japan activity view      | `0x100195994` | Shows `108F` history layout details.                                                                                    |
+| T-Union AID gate         | `0x1001D6A98` | Checks initial selected AID `A000000632010105`.                                                                         |
+| T-Union primary purse    | `0x1001D7318` | Sends `80 5C 00 02`, `Le=04`.                                                                                           |
+| T-Union negative purse   | `0x1001D794C` | Sends `80 5C 01 02`, `Le=04`.                                                                                           |
+| KSX6924 AID set          | `0x1001726B8` | Includes Hyundai, T-Money, Cashbee, EB Card, Snapper/MOIBA, and K-Cash AIDs.                                            |
+
+## Y Mobile IDA Source
+
+Y Mobile was inspected through the local IDA MCP instance:
+
+- IDB: `/Users/qaq/Desktop/Payload/Runner.app/Frameworks/App.framework/App.i64`
+- MCP endpoint: `http://127.0.0.1:13339/mcp`
+- Binary: `App.framework/App`
+- Flutter source marker: `package:card_reader_flutter/cardreader/Types/OctopusReader.dart`
+
+Useful Y Mobile addresses:
+
+| Area                    |    Address | Finding                                                                  |
+| ----------------------- | ---------: | ------------------------------------------------------------------------ |
+| Octopus source marker   | `0x437ef0` | Dart AOT string for `OctopusReader.dart`.                                |
+| Octopus command marker  | `0x4a6b10` | String `060080080117`, matching FeliCa system `8008` and service `0117`. |
+| Octopus balance formula | `0x24A910` | Parses response data, then computes `(raw - 350) / 10` as HKD.           |
+| Raw offset instruction  | `0x24A9C0` | `SUB X1, X0, #0x15E`, where `0x15E` is decimal `350`.                    |
+
+Y Mobile's Dart AOT code gives the strongest live-read evidence for the current Octopus path. The loaded `Runner` binary is the Flutter shell, while `App.framework/App` contains the Dart AOT snapshot with the Octopus reader strings and balance arithmetic. The balance function at `0x24A910` calls the response parser, subtracts `350`, converts to double, divides by `10`, and stores the resulting HKD value.
+
+The `500` constant appears elsewhere in the Dart AOT image, including Flutter/runtime-style code and generated object-pool setup. The Octopus balance call chain found from `OctopusReader.dart`, `060080080117`, and the balance formula uses `350`.
+
+## Implemented Fixes
+
+### Japan IC, ICOCA, Nimoca
+
+CardBal confirms the standard Japan Transit IC balance path:
+
+- FeliCa system code: `0003`
+- Balance service: `008B`, encoded for CoreNFC as `8B 00`
+- Balance bytes: block bytes 11-12
+- Endianness: little-endian
+- Unit: JPY
+
+CoreExtendedNFC now reads the balance at offset `0x0B`, matching CardBal. The history read limit is also increased to 20 blocks. Extra logs now include system code, service request versions, raw balance block, raw history blocks, and parsed balance.
+
+### Hong Kong Octopus
+
+CardBal, Metrodroid, FareBot, and TRETJapanNFCReader agree on the card path:
+
+- FeliCa system code: `8008`
+- Balance service: `0117`, encoded for CoreNFC as `17 01`
+- Balance block: block 0
+- Raw value: first four bytes, big-endian
+- Live-read raw offset: `350`
+- Formula in HKD cents: `(raw - offset) * 10`
+
+Octopus' official FAQ states the HK$50 convenience limit applies to On-Loan Octopus cards issued on or after 2017-10-01 and mobile Octopus products. CardBal and Y Mobile both still use raw offset `350` for service `0117` live balance arithmetic. Metrodroid and FareBot use scan time as a `350`/`500` proxy, which is useful for synthetic tests and weaker for live physical-card reads.
+
+CoreExtendedNFC adds `OctopusReader`, dispatches FeliCa system code `8008` to that reader, formats HKD balances, and logs raw block details. The unified `TransitBalance.balanceRaw` value stores cents. The reader uses offset `350`, matching CardBal, Y Mobile, and the physical-card scan where raw `920` displays HK$57.00.
+
+Octopus offset decision:
+
+- Live service `0117` balance reads use offset `350`.
+- Raw `920` yields `(920 - 350) * 10 = 5700` HKD cents, displayed as HK$57.00.
+- Applying offset `500` to the same raw value displays HK$42.00, which is HK$15.00 below the observed card balance.
+- CoreExtendedNFC keeps a single live-read offset constant until a reliable card-side signal identifies a different raw-value encoding.
+
+### China T-Union, Shenzhen Tong, Nanjing
+
+CardBal confirms the T-Union balance flow:
+
+- AID: `A000000632010105`
+- Primary purse APDU: `80 5C 00 02`, `Le=04`
+- Negative purse APDU: `80 5C 01 02`, `Le=04`
+- Balance bytes: low 31 bits of the big-endian 4-byte response
+- Final balance: primary purse minus negative purse
+- Unit: CNY fen
+
+Shanghai Public Transportation Card official app IDA findings:
+
+- Binary: `/Users/qaq/Desktop/Payload/上海交通卡.app/上海交通卡`, SHA-256 `67cd64bbc104382c727c086de4c567a7fc39ad8a4291e8e49ce3fced9a211c6f`
+- `JYNFCManager` drives ISO 7816 NFC reads through `NFCISO7816APDU(initWithData:)` and `sendCommandAPDU:completionHandler:`.
+- `sub_1008DDE0C` sends `00A4040008A000000632010105`, selecting the T-Union AID.
+- `sub_1008DE030` and related card-info paths send `00B0950000`, a READ BINARY command for SFI `0x15`.
+- `sub_1008DED78` parses one balance response by taking `data[0..<4]` as the primary value and `data[6..<9]` as the negative value, converting both from hex-coded decimal text, then storing `primary - negative` through `setBalance:`.
+
+Metrodroid documents the top bit as a spare/garbage bit, so CoreExtendedNFC masks with `0x7FFFFFFF` before displaying the value. CoreExtendedNFC reads both purse slots and logs SELECT, each purse APDU response, and the final parsed value. A confirmed Shanghai Public Transportation Card returned `00000320` from both purse slots and has a displayed balance of CNY 0.00, which validates the purse-delta formula. For file `0x15` metadata, CoreExtendedNFC first tries `SELECT 0015` plus READ BINARY and then falls back to the official app's `00B0950000` SFI direct-read path when the explicit file SELECT fails. Existing Shenzhen and Nanjing T-Union cards should follow this same AID path when the card exposes the national transport application.
+
+The T-Union AID `A000000632010105` is required in the sample app polling identifiers for CoreNFC ISO 7816 APDU access. The older Shenzhen Tong AID `5041592E535A54` is also present for discovery and logging. Confirmed balance support uses the T-Union AID path above.
+
+### Snapper / KSX6924
+
+CardBal includes the KSX6924-family AID set:
+
+- Hyundai: `A0000004520001`
+- T-Money: `D4100000030001`
+- Cashbee: `D4100000140001`
+- EB Card: `D410000029000001`
+- Snapper / MOIBA: `D4100000300001`
+- K-Cash: `D4106509900020`
+
+CoreExtendedNFC now tries these AIDs in that order and logs SELECT outcomes, balance APDU responses, and record reads. The sample app `Info.plist` mirrors these AIDs so CoreNFC can surface and transceive with those ISO 7816 applications. The balance APDU remains the KSX6924 command `90 4C 00 00`, `Le=04`.
+
+`KSX6924Reader` continues AID probing when a selectable application reports a recoverable SELECT status through either a response status word or an `unexpectedStatusWord` transport error.
+
+### Taiwan EasyCard
+
+Metrodroid exposes the old EasyCard Classic dump layout:
+
+- Card family: MIFARE Classic, keys required
+- Magic: sector 0 block 1 equals `0e140001070208030904081000000000`
+- Balance: sector 2 block 0, offset 0, 4-byte little-endian TWD amount
+- Refill: sector 2 block 2
+- Transactions: sector 3 blocks 1-2, sector 4 blocks 0-2, sector 5 blocks 0-2
+- Time: Taipei timezone, seconds since Unix epoch
+
+CoreExtendedNFC formats `TWD` balances as `NT$` integer amounts, ready for a Classic dump parser that consumes already-decrypted dump data.
+
+## Researched Cards
+
+| Card                         | Protocol reality                                                                                                                  | Current library handling                                                       |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| EasyCard                     | Classic EasyCard is MIFARE Classic. Crypto1 authenticated reads sit outside iOS CoreNFC's public API.                             | Identification/logging path only.                                              |
+| Octopus                      | FeliCa system `8008`, service `0117`.                                                                                             | Implemented balance reader.                                                    |
+| T-Union / Shenzhen / Nanjing | ISO 7816 AID `A000000632010105`, dual-purse balance.                                                                              | Implemented dual-purse balance.                                                |
+| Singpass                     | Singpass is an identity/verification product. Singapore passport reading is eMRTD; CEPAS/EZ-Link uses separate transit-card AIDs. | Existing passport module covers eMRTD. CEPAS AID discovery was added for logs. |
+| ICOCA                        | Japan Transit IC on FeliCa system `0003`.                                                                                         | Implemented via Japan IC reader with corrected offset.                         |
+| Nimoca                       | Japan Transit IC on FeliCa system `0003`.                                                                                         | Implemented via Japan IC reader with corrected offset.                         |
+| AT HOP                       | MIFARE DESFire EV1 with locked transit files. Public research exposes serial-level data more readily than balance.                | DESFire identification/logging path.                                           |
+| Snapper                      | KSX6924-family card path in public research and CardBal AID table.                                                                | Added AID probing through KSX6924 reader.                                      |
+
+## Validation Notes
+
+`swift test` is a macOS package invocation and fails because the macOS toolchain lacks CoreNFC. The project is iOS-only, so the validation target is:
+
+```bash
+xcodebuild -project Example/CENFC.xcodeproj -scheme CENFC -destination 'generic/platform=iOS Simulator' build
+```
+
+The iOS simulator build passed after these changes.
+
+For the user's physical cards, the best next capture is one scan per card with NFC logging enabled. The key log fields are:
+
+- FeliCa: system code, service versions, raw balance block, raw history blocks.
+- ISO 7816: selected AID, APDU command path, status words, raw balance bytes.
+- DESFire: selected applications and file metadata where available.

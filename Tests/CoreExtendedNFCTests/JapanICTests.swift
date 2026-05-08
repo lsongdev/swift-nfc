@@ -2,7 +2,7 @@
 //
 // ## References
 // - CJRC system code 0x0003
-// - Balance: service 0x008B, 1 block, bytes 0x0A-0x0B little-endian (JPY)
+// - Balance: service 0x008B, 1 block, bytes 0x0B-0x0C little-endian (JPY)
 // - History: service 0x090F, up to 20 blocks (cyclic)
 // - Date encoding: 2 bytes BE, year(7) month(4) day(5), base 2000
 @testable import CoreExtendedNFC
@@ -14,10 +14,10 @@ struct JapanICTests {
 
     @Test
     func `Read balance from Japan IC card`() async throws {
-        // Build a 16-byte balance block with 1,234 yen at offset 0x0A (LE)
+        // Build a 16-byte balance block with 1,234 yen at offset 0x0B (LE)
         var balanceBlock = Data(repeating: 0x00, count: 16)
-        balanceBlock[0x0A] = 0xD2 // 1234 & 0xFF
-        balanceBlock[0x0B] = 0x04 // 1234 >> 8
+        balanceBlock[0x0B] = 0xD2 // 1234 & 0xFF
+        balanceBlock[0x0C] = 0x04 // 1234 >> 8
 
         let transport = MockFeliCaServiceTransport(
             serviceVersions: [Data([0x8B, 0x00]): Data([0x00, 0x10])],
@@ -38,9 +38,8 @@ struct JapanICTests {
     @Test
     func `Read balance and history`() async throws {
         var balanceBlock = Data(repeating: 0x00, count: 16)
-        balanceBlock[0x0A] = 0xE8 // 500 & 0xFF = 0xF4... wait, 500 = 0x01F4
-        balanceBlock[0x0A] = 0xF4
-        balanceBlock[0x0B] = 0x01
+        balanceBlock[0x0B] = 0xF4
+        balanceBlock[0x0C] = 0x01
 
         // History block: usage=0x01 (trip), date=2024-03-15, balance=500
         var historyBlock = Data(repeating: 0x00, count: 16)
@@ -79,6 +78,100 @@ struct JapanICTests {
         #expect(tx.balanceAfter == 500)
         #expect(tx.entryStation == "0123")
         #expect(tx.exitStation == "0456")
+    }
+
+    @Test
+    func `Logged Japan IC card replays twenty history blocks`() async throws {
+        let transport = loggedJapanICTransport(
+            identifier: "010103126B20DB14",
+            balanceBlock: "00000000000000002000001B0000006F",
+            historyBlocks: [
+                "C746000030B59825DCAD1B0000006F00",
+                "1601000230B563237024A80000006E00",
+                "1601000230B501E66323740200006C00",
+                "1601001730B5D470FABBA80500006AA0",
+                "050F000F30B40E38011F7808000068A0",
+                "1601000230B401FB01F84A0900006700",
+                "1601000230B401E601FBF40900006500",
+                "C746000030B44F05E0AB2E0C00006300",
+                "1601000230B381248117C70D000062A0",
+                "1601000230B3812A8123E90E000060A0",
+                "1601000230B363110C0CD90F00005E00",
+                "1601000230B363136311191100005C00",
+                "1601000230B363116313A51100005A00",
+                "1601000230B301E86311311200005800",
+                "1601000230B38117811C1114000056A0",
+                "0802000030B381170000011500005480",
+                "1601000230B2812A81177901000053A0",
+                "C846000030B2A5C869709B0200005100",
+                "1601000230B2811C81288B03000050A0",
+                "1601000230B28117811C7B0400004EA0",
+            ]
+        )
+
+        let result = try await JapanICReader(transport: transport).readBalanceAndHistory()
+
+        #expect(result.serialNumber == "010103126B20DB14")
+        #expect(result.balanceRaw == 27)
+        #expect(result.transactions.count == 20)
+
+        let first = try #require(result.transactions.first)
+        #expect(first.type == .purchase)
+        #expect(first.balanceAfter == 27)
+        #expect(first.entryStation == "9825")
+        #expect(first.exitStation == "DCAD")
+
+        let topup = result.transactions[15]
+        #expect(topup.type == .topup)
+        #expect(topup.balanceAfter == 5377)
+        #expect(topup.entryStation == "8117")
+    }
+
+    @Test
+    func `Logged low-balance Japan IC card preserves sparse history blocks`() async throws {
+        let transport = loggedJapanICTransport(
+            identifier: "0101011278224813",
+            balanceBlock: "00000000000000003000000A00000006",
+            historyBlocks: [
+                "C746000030B59825DCAD0A0000000600",
+                "1601000230AE01CC0B02C80000000500",
+                "1601000230AE0B0201CC5E0100000300",
+                "0807000030AE0B020000F40100000100",
+                "00000080000000000000000000000000",
+                "00000000000000000000000000000000",
+                "00000080000000000000000000000000",
+                "00000000000000000000000000000000",
+                "00000080000000000000000000000000",
+                "00000000000000000000000000000000",
+                "00000080000000000000000000000000",
+                "00000000000000000000000000000000",
+                "00000080000000000000000000000000",
+                "00000000000000000000000000000000",
+                "00000080000000000000000000000000",
+                "00000000000000000000000000000000",
+                "00000080000000000000000000000000",
+                "00000000000000000000000000000000",
+                "00000080000000000000000000000000",
+                "00000000000000000000000000000000",
+            ]
+        )
+
+        let result = try await JapanICReader(transport: transport).readBalanceAndHistory()
+
+        #expect(result.serialNumber == "0101011278224813")
+        #expect(result.balanceRaw == 10)
+        #expect(result.transactions.count == 12)
+
+        let first = try #require(result.transactions.first)
+        #expect(first.type == .purchase)
+        #expect(first.balanceAfter == 10)
+        #expect(first.entryStation == "9825")
+        #expect(first.exitStation == "DCAD")
+
+        let sparse = result.transactions[4]
+        #expect(sparse.type == .trip)
+        #expect(sparse.balanceAfter == 0)
+        #expect(sparse.entryStation == "0000")
     }
 
     @Test
@@ -196,5 +289,35 @@ struct JapanICTests {
         let reader = JapanICReader(transport: transport)
         let result = try await reader.readBalance()
         #expect(result.balanceRaw == 0)
+    }
+
+    private func loggedJapanICTransport(
+        identifier: String,
+        balanceBlock: String,
+        historyBlocks: [String]
+    ) -> MockFeliCaServiceTransport {
+        MockFeliCaServiceTransport(
+            serviceVersions: [
+                JapanICConstants.balanceServiceCode: Data([0x03, 0x00]),
+                JapanICConstants.historyServiceCode: Data([0x03, 0x00]),
+            ],
+            serviceBlocks: [
+                JapanICConstants.balanceServiceCode: [hexToData(balanceBlock)],
+                JapanICConstants.historyServiceCode: historyBlocks.map(hexToData),
+            ],
+            systemCode: JapanICConstants.systemCode,
+            identifier: hexToData(identifier)
+        )
+    }
+
+    private func hexToData(_ hex: String) -> Data {
+        var data = Data()
+        var chars = hex.makeIterator()
+        while let c1 = chars.next(), let c2 = chars.next() {
+            if let byte = UInt8(String([c1, c2]), radix: 16) {
+                data.append(byte)
+            }
+        }
+        return data
     }
 }
